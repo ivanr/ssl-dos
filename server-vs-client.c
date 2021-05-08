@@ -80,11 +80,11 @@ static int determine_overhead(SSL *ssl, struct result *result) {
   int i;
 
   BIO *bio = SSL_get_rbio(ssl);	
-  result->handshake_read = bio->num_read;
-  result->handshake_write = bio->num_write;	
+  result->handshake_read = BIO_number_read(bio);
+  result->handshake_write = BIO_number_written(bio);	
 					
   for (i = 0; i < (data_writes == 0 ? 1 : data_writes); i++) {			
-    size_t bio_write_before = bio->num_write;
+    size_t bio_write_before = BIO_number_written(bio);
 			
     int r = SSL_write(ssl, buf, data_write_len);
     switch(SSL_get_error(ssl, r)) {
@@ -101,7 +101,7 @@ static int determine_overhead(SSL *ssl, struct result *result) {
         return -1;				
     }	
 		
-    result->enc_data_len += bio->num_write - bio_write_before;
+    result->enc_data_len += BIO_number_written(bio) - bio_write_before;
     
     r = SSL_read(ssl, buf, data_write_len);	
 		switch(SSL_get_error(ssl, r)) {
@@ -174,7 +174,7 @@ static pthread_t start_client(const char *ciphersuite) {
   SSL_CTX *ctx;
 
   start("Initializing client");
-  if ((ctx = SSL_CTX_new(TLSv1_2_client_method())) == NULL)
+  if ((ctx = SSL_CTX_new(TLS_client_method())) == NULL)
     fail("Unable to initialize SSL context:\n%s",
          ERR_error_string(ERR_get_error(), NULL));
 	 
