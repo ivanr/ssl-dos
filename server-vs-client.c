@@ -183,11 +183,21 @@ static pthread_t start_client(const char *ciphersuite) {
   #ifdef SSL_OP_NO_COMPRESSION
   SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
   #endif
-
-  if (SSL_CTX_set_cipher_list(ctx, ciphersuite) != 1)
-    fail("Unable to set cipher list to %s:\n%s",
-         ciphersuite,
-         ERR_error_string(ERR_get_error(), NULL));
+  
+  if (SSL_CTX_set_ciphersuites(ctx, ciphersuite) != 1) {
+    // Setting a TLS 1.3 suite failed, so let's assume it's TLS 1.2
+    // or below. Also, disable TLS 1.3 just in case.
+    
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+    
+    if (SSL_CTX_set_cipher_list(ctx, ciphersuite) != 1)
+      fail("Unable to set cipher list to %s:\n%s",
+           ciphersuite,
+           ERR_error_string(ERR_get_error(), NULL));
+  } else {
+    // Setting a TLS 1.3 worked, so we want to enable only TLS 1.3.
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+  }
 
   pthread_t threadid;
   if (pthread_create(&threadid, NULL, &client_thread, ctx))
@@ -267,7 +277,7 @@ static pthread_t start_server(const char *ciphersuite,
   SSL_CTX *ctx;
 
   start("Initializing server");
-  if ((ctx = SSL_CTX_new(SSLv23_server_method())) == NULL)
+  if ((ctx = SSL_CTX_new(TLS_server_method())) == NULL)
     fail("Unable to initialize SSL context:\n%s",
 	 ERR_error_string(ERR_get_error(), NULL));
 	 
@@ -276,10 +286,20 @@ static pthread_t start_server(const char *ciphersuite,
   #endif
 
   /* Cipher suite */
-  if (SSL_CTX_set_cipher_list(ctx, ciphersuite) != 1)
-    fail("Unable to set cipher list to %s:\n%s",
-	 ciphersuite,
-	 ERR_error_string(ERR_get_error(), NULL));
+  if (SSL_CTX_set_ciphersuites(ctx, ciphersuite) != 1) {
+    // Setting a TLS 1.3 suite failed, so let's assume it's TLS 1.2
+    // or below. Also, disable TLS 1.3 just in case.
+    
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+    
+    if (SSL_CTX_set_cipher_list(ctx, ciphersuite) != 1)
+      fail("Unable to set cipher list to %s:\n%s",
+	   ciphersuite,
+	   ERR_error_string(ERR_get_error(), NULL));
+  } else {
+    // Setting a TLS 1.3 worked, so we want to enable only TLS 1.3.
+    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+  }
 
   /* Disable session caching */	 
   SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
@@ -337,6 +357,9 @@ static pthread_t start_server(const char *ciphersuite,
   if (ecdh == NULL) {      
     ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);      
   }    
+
+  //ecdh = EC_KEY_new_by_curve_name(NID_X25519);        
+  //ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);      
   
   SSL_CTX_set_tmp_ecdh(ctx,ecdh);
   EC_KEY_free(ecdh);  
