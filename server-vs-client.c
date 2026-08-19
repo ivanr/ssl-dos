@@ -159,7 +159,79 @@ client_error:
   return &result;
 }
 
-static pthread_t start_client(const char *ciphersuite) {
+/* Configure key exchange for one side of the connection.
+
+   `params` is either the name of a file or a group list. A file may hold
+   DH parameters or EC parameters, and a single read tells us which; the
+   decoder skips over any key and certificate the file also contains. A
+   group list is anything OpenSSL accepts in the supported_groups
+   extension, which is the only way to name groups that have no parameter
+   encoding of their own: X25519, MLKEM1024, X25519MLKEM768 and friends.
+   `openssl list -tls-groups` prints the ones this build knows.
+
+   Both peers need the same setting. If they disagree the server sends a
+   HelloRetryRequest and the client generates a second key share, which
+   is a different handshake from the one we mean to measure.
+
+   With no parameters at all, OpenSSL picks a group on its own. */
+static void set_params(SSL_CTX *ctx, const char *params, int server) {
+  if (!params || !*params)
+    return;
+
+  BIO *bio = BIO_new_file(params, "r");
+  if (!bio) {
+    /* Not a file, so read it as a group list. */
+    ERR_clear_error();
+    if (SSL_CTX_set1_groups_list(ctx, params) != 1)
+      fail("Unable to set group list to %s:\n%s", params,
+	   ERR_error_string(ERR_get_error(), NULL));
+    return;
+  }
+
+  EVP_PKEY *pkey = PEM_read_bio_Parameters(bio, NULL);
+  BIO_free(bio);
+  if (!pkey)
+    return;
+
+  switch (EVP_PKEY_get_base_id(pkey)) {
+  case EVP_PKEY_DH:
+  case EVP_PKEY_DHX:
+    /* Only the server chooses the DH group, and on success the context
+       takes ownership of the key. A bundle carries DH parameters whether
+       or not the cipher suite under test wants them, so a refusal here
+       (OpenSSL 3.x rejects small groups outright) is not worth dying
+       over. */
+    if (!server || SSL_CTX_set0_tmp_dh_pkey(ctx, pkey) != 1) {
+      if (server)
+	warn("Ignoring unusable DH parameters:\n%s",
+	     ERR_error_string(ERR_get_error(), NULL));
+      EVP_PKEY_free(pkey);
+    }
+    break;
+
+  case EVP_PKEY_EC: {
+    /* Restrict the handshake to the curve named in the file. Unlike the
+       old SSL_CTX_set_tmp_ecdh(), this also applies to TLS 1.3. */
+    char   group[80];
+    size_t group_len = 0;
+
+    if (EVP_PKEY_get_group_name(pkey, group, sizeof(group),
+				&group_len) != 1)
+      fail("Unable to find specified named curve");
+    if (SSL_CTX_set1_groups_list(ctx, group) != 1)
+      fail("Unable to set group list to %s:\n%s", group,
+	   ERR_error_string(ERR_get_error(), NULL));
+    EVP_PKEY_free(pkey);
+    break;
+  }
+
+  default:
+    EVP_PKEY_free(pkey);
+    break;
+  }
+}
+
+static pthread_t start_client(const char *ciphersuite, const char *params) {
   SSL_CTX *ctx;
 
   start("Initializing client");
@@ -191,6 +263,8 @@ static pthread_t start_client(const char *ciphersuite) {
     // Setting a TLS 1.3 worked, so we want to enable only TLS 1.3.
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
   }
+
+  set_params(ctx, params, 0);
 
   pthread_t threadid;
   if (pthread_create(&threadid, NULL, &client_thread, ctx))
@@ -308,57 +382,7 @@ static pthread_t start_server(const char *ciphersuite,
     fail("Unable to use given key file:\n%s",
 	 ERR_error_string(ERR_get_error(), NULL));
 
-  /* Key exchange parameters. The same file may hold either DH parameters
-     or EC parameters; a single read tells us which, and the decoder skips
-     over any key and certificate the file also happens to contain.
-
-     If no parameters are given, OpenSSL negotiates a curve on its own. */
-  if (params) {
-    BIO *bio = BIO_new_file(params, "r");
-    if (!bio)
-      fail("Unable to read parameters:\n%s",
-	   ERR_error_string(ERR_get_error(), NULL));
-
-    EVP_PKEY *pkey = PEM_read_bio_Parameters(bio, NULL);
-    BIO_free(bio);
-
-    if (pkey) {
-      switch (EVP_PKEY_get_base_id(pkey)) {
-      case EVP_PKEY_DH:
-      case EVP_PKEY_DHX:
-	/* On success the context takes ownership of the key. A bundle
-	   carries DH parameters whether or not the cipher suite under
-	   test wants them, so a refusal here (OpenSSL 3.x rejects small
-	   groups outright) is not worth dying over. */
-	if (SSL_CTX_set0_tmp_dh_pkey(ctx, pkey) != 1) {
-	  warn("Ignoring unusable DH parameters:\n%s",
-	       ERR_error_string(ERR_get_error(), NULL));
-	  EVP_PKEY_free(pkey);
-	}
-	break;
-
-      case EVP_PKEY_EC: {
-	/* Restrict the handshake to the curve named in the file. Unlike
-	   the old SSL_CTX_set_tmp_ecdh(), this also applies to TLS 1.3. */
-	char   group[80];
-	size_t group_len = 0;
-
-	if (EVP_PKEY_get_group_name(pkey, group, sizeof(group),
-				    &group_len) != 1)
-	  fail("Unable to find specified named curve");
-	if (SSL_CTX_set1_groups_list(ctx, group) != 1)
-	  fail("Unable to set group list to %s:\n%s", group,
-	       ERR_error_string(ERR_get_error(), NULL));
-	EVP_PKEY_free(pkey);
-	break;
-      }
-
-      default:
-	EVP_PKEY_free(pkey);
-	break;
-      }
-    }
-  }
+  set_params(ctx, params, 1);
 
   pthread_t threadid;
   if (pthread_create(&threadid, NULL, &server_thread, ctx))
@@ -378,7 +402,10 @@ main(int argc, char * const argv[]) {
     fprintf(stderr, "\n");
     fprintf(stderr, " - `certificate` is the name of the file containing the key and certificate.\n");    
     fprintf(stderr, "\n");
-    fprintf(stderr, " - `params` is the name of the file containing DH or ECDH params.\n");
+    fprintf(stderr, " - `params` selects the key exchange. It is either the name of a\n");
+    fprintf(stderr, "   file containing DH or ECDH params, or a group list such as\n");
+    fprintf(stderr, "   `x25519`, `ffdhe2048` or `X25519MLKEM768`. Run\n");
+    fprintf(stderr, "   `openssl list -tls-groups` to see what is supported.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, " - `handshakes` is the number of handshakes you wish to\n");
     fprintf(stderr, "   test. Defaults to 1000.\n");
@@ -422,7 +449,7 @@ main(int argc, char * const argv[]) {
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, clientserver))
     fail("Unable to get a socket pair for client/server communication:\n%m");
   server = start_server(ciphersuite, certificate, params);
-  client = start_client(ciphersuite);
+  client = start_client(ciphersuite, params);
 
   struct result *client_result, *server_result;
   start("Waiting for client to finish");
