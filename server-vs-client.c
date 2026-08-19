@@ -39,6 +39,8 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/core_names.h>
+#include <openssl/params.h>
 
 int handshake_count = 1000;
 
@@ -185,6 +187,32 @@ static void set_params(SSL_CTX *ctx, const char *params, int server) {
     if (SSL_CTX_set1_groups_list(ctx, params) != 1)
       fail("Unable to set group list to %s:\n%s", params,
 	   ERR_error_string(ERR_get_error(), NULL));
+
+    /* A TLS 1.2 server picks the DH group itself and will not serve a DHE
+       cipher suite without one, so a bare group name would otherwise fail.
+       SSL_CTX_set_dh_auto() is no good here: it chooses by key strength and
+       ignores supported_groups, so every ffdhe name would land on the same
+       group. Build the named group explicitly instead. Names that are not
+       finite-field groups simply fail to generate, which is what we want.
+       TLS 1.3 ignores this, having no server-chosen parameters at all. */
+    if (server) {
+      EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL);
+      EVP_PKEY *dh = NULL;
+      OSSL_PARAM ps[2] = {
+	OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME,
+					 (char *)params, 0),
+	OSSL_PARAM_construct_end()
+      };
+
+      if (pctx && EVP_PKEY_paramgen_init(pctx) > 0 &&
+	  EVP_PKEY_CTX_set_params(pctx, ps) > 0 &&
+	  EVP_PKEY_paramgen(pctx, &dh) > 0 &&
+	  SSL_CTX_set0_tmp_dh_pkey(ctx, dh) != 1)
+	EVP_PKEY_free(dh);
+
+      EVP_PKEY_CTX_free(pctx);
+      ERR_clear_error();
+    }
     return;
   }
 
