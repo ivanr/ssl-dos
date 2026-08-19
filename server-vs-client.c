@@ -27,6 +27,7 @@
 #include "common.h"
 
 #include <unistd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -36,6 +37,8 @@
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
 
 int handshake_count = 1000;
 
@@ -54,20 +57,6 @@ struct result {
   unsigned int enc_data_len;
 };
 int       clientserver[2];
-
-/* OpenSSL threading */
-static pthread_mutex_t *mutex_buf = NULL;
-static void locking_function(int mode, int n,
-			     const char * file,
-			     int line) {
-  if (mode & CRYPTO_LOCK)
-    pthread_mutex_lock(&mutex_buf[n]);
-  else
-    pthread_mutex_unlock(&mutex_buf[n]);
-}
-static unsigned long id_function(void) {
-  return ((unsigned long)pthread_self());
-}
 
 /* Dunno why I should declare it */
 extern int pthread_getcpuclockid (pthread_t,
@@ -177,7 +166,11 @@ static pthread_t start_client(const char *ciphersuite) {
   if ((ctx = SSL_CTX_new(TLS_client_method())) == NULL)
     fail("Unable to initialize SSL context:\n%s",
          ERR_error_string(ERR_get_error(), NULL));
-	 
+
+  /* We deliberately benchmark small keys and weak cipher suites, so lift
+     the default security level out of the way. */
+  SSL_CTX_set_security_level(ctx, 0);
+
   SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
 	
   #ifdef SSL_OP_NO_COMPRESSION
@@ -280,7 +273,10 @@ static pthread_t start_server(const char *ciphersuite,
   if ((ctx = SSL_CTX_new(TLS_server_method())) == NULL)
     fail("Unable to initialize SSL context:\n%s",
 	 ERR_error_string(ERR_get_error(), NULL));
-	 
+
+  /* See start_client(). */
+  SSL_CTX_set_security_level(ctx, 0);
+
   #ifdef SSL_OP_NO_COMPRESSION
   SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
   #endif
@@ -312,57 +308,57 @@ static pthread_t start_server(const char *ciphersuite,
     fail("Unable to use given key file:\n%s",
 	 ERR_error_string(ERR_get_error(), NULL));
 
-  if (params) {
-    /* DH */
-    DH *dh;
-    BIO *bio;
-    bio = BIO_new_file(params, "r");
-    if (!bio)
-      fail("Unable to read certificate:\n%s",
-      ERR_error_string(ERR_get_error(), NULL));
+  /* Key exchange parameters. The same file may hold either DH parameters
+     or EC parameters; a single read tells us which, and the decoder skips
+     over any key and certificate the file also happens to contain.
 
-    dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
+     If no parameters are given, OpenSSL negotiates a curve on its own. */
+  if (params) {
+    BIO *bio = BIO_new_file(params, "r");
+    if (!bio)
+      fail("Unable to read parameters:\n%s",
+	   ERR_error_string(ERR_get_error(), NULL));
+
+    EVP_PKEY *pkey = PEM_read_bio_Parameters(bio, NULL);
     BIO_free(bio);
-    if (dh) {
-      SSL_CTX_set_tmp_dh(ctx, dh);
-      DH_free(dh);
+
+    if (pkey) {
+      switch (EVP_PKEY_get_base_id(pkey)) {
+      case EVP_PKEY_DH:
+      case EVP_PKEY_DHX:
+	/* On success the context takes ownership of the key. A bundle
+	   carries DH parameters whether or not the cipher suite under
+	   test wants them, so a refusal here (OpenSSL 3.x rejects small
+	   groups outright) is not worth dying over. */
+	if (SSL_CTX_set0_tmp_dh_pkey(ctx, pkey) != 1) {
+	  warn("Ignoring unusable DH parameters:\n%s",
+	       ERR_error_string(ERR_get_error(), NULL));
+	  EVP_PKEY_free(pkey);
+	}
+	break;
+
+      case EVP_PKEY_EC: {
+	/* Restrict the handshake to the curve named in the file. Unlike
+	   the old SSL_CTX_set_tmp_ecdh(), this also applies to TLS 1.3. */
+	char   group[80];
+	size_t group_len = 0;
+
+	if (EVP_PKEY_get_group_name(pkey, group, sizeof(group),
+				    &group_len) != 1)
+	  fail("Unable to find specified named curve");
+	if (SSL_CTX_set1_groups_list(ctx, group) != 1)
+	  fail("Unable to set group list to %s:\n%s", group,
+	       ERR_error_string(ERR_get_error(), NULL));
+	EVP_PKEY_free(pkey);
+	break;
+      }
+
+      default:
+	EVP_PKEY_free(pkey);
+	break;
+      }
     }
   }
-
-  /* ECDH */
-  EC_KEY *ecdh = NULL;
-  EC_GROUP *ecg = NULL;  
-  
-  if (params) {
-    BIO *bio;
-    bio = BIO_new_file(params, "r");
-    if (!bio)
-      fail("Unable to read certificate:\n%s",
-      ERR_error_string(ERR_get_error(), NULL));
-  
-    /* Try to read EC parameters from the certificate file first. */
-    ecg = PEM_read_bio_ECPKParameters(bio, NULL, NULL, NULL);
-    BIO_free(bio);
-    if (ecg) {
-        int nid = EC_GROUP_get_curve_name(ecg);
-        if (!nid) {
-          fail("Unable to find specified named curve");
-        }
-      
-        ecdh = EC_KEY_new_by_curve_name(nid);
-    }
-  }
-
-  /* Use prime256v1 by default. */
-  if (ecdh == NULL) {      
-    ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);      
-  }    
-
-  //ecdh = EC_KEY_new_by_curve_name(NID_X25519);        
-  //ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);      
-  
-  SSL_CTX_set_tmp_ecdh(ctx,ecdh);
-  EC_KEY_free(ecdh);  
 
   pthread_t threadid;
   if (pthread_create(&threadid, NULL, &server_thread, ctx))
@@ -413,15 +409,13 @@ main(int argc, char * const argv[]) {
     }
   }
 
-  start("Initialize OpenSSL library");
-  SSL_load_error_strings();
-  SSL_library_init();
-  if (!(mutex_buf = malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t))))
-    fail("Unable to allocate memory for mutex");
-  for (int i = 0;  i < CRYPTO_num_locks();  i++)
-    pthread_mutex_init(&mutex_buf[i], NULL);
-  CRYPTO_set_id_callback(id_function);
-  CRYPTO_set_locking_callback(locking_function);
+  /* OpenSSL 1.1.0 and later initialize themselves on first use and are
+     thread-safe without any locking callbacks from the application. */
+
+  /* Whichever of the two threads finishes first closes its end of the
+     socket pair, so the other one is bound to write to a closed peer.
+     We want the error from write(), not the default SIGPIPE death. */
+  signal(SIGPIPE, SIG_IGN);
 
   pthread_t client, server;
   start("Prepare client and server");
