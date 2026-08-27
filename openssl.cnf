@@ -1,0 +1,20 @@
+# Template for the self-signed test certificates built by the Makefile.
+# Replaces the GnuTLS certtool.cfg this repository used to carry.
+
+[req]
+distinguished_name = dn
+x509_extensions    = v3
+prompt             = no
+
+[dn]
+C  = GR
+ST = Attiki
+O  = Koko inc.
+OU = sleeping dept.
+CN = Cindy Lauper
+
+[v3]
+basicConstraints = CA:true
+keyUsage         = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName   = DNS:www.example.org, email:none@example.org

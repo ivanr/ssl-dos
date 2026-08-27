@@ -5,3 +5,4 @@ doc/
 *.exe
 *.key
 *.crt
+.DS_Store

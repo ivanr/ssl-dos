@@ -27,6 +27,7 @@
 #include "common.h"
 
 #include <unistd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
@@ -36,6 +37,10 @@
 #include <openssl/ssl.h>
 #include <openssl/bio.h>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/core_names.h>
+#include <openssl/params.h>
 
 int handshake_count = 1000;
 
@@ -54,20 +59,6 @@ struct result {
   unsigned int enc_data_len;
 };
 int       clientserver[2];
-
-/* OpenSSL threading */
-static pthread_mutex_t *mutex_buf = NULL;
-static void locking_function(int mode, int n,
-			     const char * file,
-			     int line) {
-  if (mode & CRYPTO_LOCK)
-    pthread_mutex_lock(&mutex_buf[n]);
-  else
-    pthread_mutex_unlock(&mutex_buf[n]);
-}
-static unsigned long id_function(void) {
-  return ((unsigned long)pthread_self());
-}
 
 /* Dunno why I should declare it */
 extern int pthread_getcpuclockid (pthread_t,
@@ -170,14 +161,116 @@ client_error:
   return &result;
 }
 
-static pthread_t start_client(const char *ciphersuite) {
+/* Configure key exchange for one side of the connection.
+
+   `params` is either the name of a file or a group list. A file may hold
+   DH parameters or EC parameters, and a single read tells us which; the
+   decoder skips over any key and certificate the file also contains. A
+   group list is anything OpenSSL accepts in the supported_groups
+   extension, which is the only way to name groups that have no parameter
+   encoding of their own: X25519, MLKEM1024, X25519MLKEM768 and friends.
+   `openssl list -tls-groups` prints the ones this build knows.
+
+   Both peers need the same setting. If they disagree the server sends a
+   HelloRetryRequest and the client generates a second key share, which
+   is a different handshake from the one we mean to measure.
+
+   With no parameters at all, OpenSSL picks a group on its own. */
+static void set_params(SSL_CTX *ctx, const char *params, int server) {
+  if (!params || !*params)
+    return;
+
+  BIO *bio = BIO_new_file(params, "r");
+  if (!bio) {
+    /* Not a file, so read it as a group list. */
+    ERR_clear_error();
+    if (SSL_CTX_set1_groups_list(ctx, params) != 1)
+      fail("Unable to set group list to %s:\n%s", params,
+	   ERR_error_string(ERR_get_error(), NULL));
+
+    /* A TLS 1.2 server picks the DH group itself and will not serve a DHE
+       cipher suite without one, so a bare group name would otherwise fail.
+       SSL_CTX_set_dh_auto() is no good here: it chooses by key strength and
+       ignores supported_groups, so every ffdhe name would land on the same
+       group. Build the named group explicitly instead. Names that are not
+       finite-field groups simply fail to generate, which is what we want.
+       TLS 1.3 ignores this, having no server-chosen parameters at all. */
+    if (server) {
+      EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_name(NULL, "DH", NULL);
+      EVP_PKEY *dh = NULL;
+      OSSL_PARAM ps[2] = {
+	OSSL_PARAM_construct_utf8_string(OSSL_PKEY_PARAM_GROUP_NAME,
+					 (char *)params, 0),
+	OSSL_PARAM_construct_end()
+      };
+
+      if (pctx && EVP_PKEY_paramgen_init(pctx) > 0 &&
+	  EVP_PKEY_CTX_set_params(pctx, ps) > 0 &&
+	  EVP_PKEY_paramgen(pctx, &dh) > 0 &&
+	  SSL_CTX_set0_tmp_dh_pkey(ctx, dh) != 1)
+	EVP_PKEY_free(dh);
+
+      EVP_PKEY_CTX_free(pctx);
+      ERR_clear_error();
+    }
+    return;
+  }
+
+  EVP_PKEY *pkey = PEM_read_bio_Parameters(bio, NULL);
+  BIO_free(bio);
+  if (!pkey)
+    return;
+
+  switch (EVP_PKEY_get_base_id(pkey)) {
+  case EVP_PKEY_DH:
+  case EVP_PKEY_DHX:
+    /* Only the server chooses the DH group, and on success the context
+       takes ownership of the key. A bundle carries DH parameters whether
+       or not the cipher suite under test wants them, so a refusal here
+       (OpenSSL 3.x rejects small groups outright) is not worth dying
+       over. */
+    if (!server || SSL_CTX_set0_tmp_dh_pkey(ctx, pkey) != 1) {
+      if (server)
+	warn("Ignoring unusable DH parameters:\n%s",
+	     ERR_error_string(ERR_get_error(), NULL));
+      EVP_PKEY_free(pkey);
+    }
+    break;
+
+  case EVP_PKEY_EC: {
+    /* Restrict the handshake to the curve named in the file. Unlike the
+       old SSL_CTX_set_tmp_ecdh(), this also applies to TLS 1.3. */
+    char   group[80];
+    size_t group_len = 0;
+
+    if (EVP_PKEY_get_group_name(pkey, group, sizeof(group),
+				&group_len) != 1)
+      fail("Unable to find specified named curve");
+    if (SSL_CTX_set1_groups_list(ctx, group) != 1)
+      fail("Unable to set group list to %s:\n%s", group,
+	   ERR_error_string(ERR_get_error(), NULL));
+    EVP_PKEY_free(pkey);
+    break;
+  }
+
+  default:
+    EVP_PKEY_free(pkey);
+    break;
+  }
+}
+
+static pthread_t start_client(const char *ciphersuite, const char *params) {
   SSL_CTX *ctx;
 
   start("Initializing client");
   if ((ctx = SSL_CTX_new(TLS_client_method())) == NULL)
     fail("Unable to initialize SSL context:\n%s",
          ERR_error_string(ERR_get_error(), NULL));
-	 
+
+  /* We deliberately benchmark small keys and weak cipher suites, so lift
+     the default security level out of the way. */
+  SSL_CTX_set_security_level(ctx, 0);
+
   SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
 	
   #ifdef SSL_OP_NO_COMPRESSION
@@ -198,6 +291,8 @@ static pthread_t start_client(const char *ciphersuite) {
     // Setting a TLS 1.3 worked, so we want to enable only TLS 1.3.
     SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
   }
+
+  set_params(ctx, params, 0);
 
   pthread_t threadid;
   if (pthread_create(&threadid, NULL, &client_thread, ctx))
@@ -280,7 +375,10 @@ static pthread_t start_server(const char *ciphersuite,
   if ((ctx = SSL_CTX_new(TLS_server_method())) == NULL)
     fail("Unable to initialize SSL context:\n%s",
 	 ERR_error_string(ERR_get_error(), NULL));
-	 
+
+  /* See start_client(). */
+  SSL_CTX_set_security_level(ctx, 0);
+
   #ifdef SSL_OP_NO_COMPRESSION
   SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
   #endif
@@ -312,57 +410,7 @@ static pthread_t start_server(const char *ciphersuite,
     fail("Unable to use given key file:\n%s",
 	 ERR_error_string(ERR_get_error(), NULL));
 
-  if (params) {
-    /* DH */
-    DH *dh;
-    BIO *bio;
-    bio = BIO_new_file(params, "r");
-    if (!bio)
-      fail("Unable to read certificate:\n%s",
-      ERR_error_string(ERR_get_error(), NULL));
-
-    dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
-    BIO_free(bio);
-    if (dh) {
-      SSL_CTX_set_tmp_dh(ctx, dh);
-      DH_free(dh);
-    }
-  }
-
-  /* ECDH */
-  EC_KEY *ecdh = NULL;
-  EC_GROUP *ecg = NULL;  
-  
-  if (params) {
-    BIO *bio;
-    bio = BIO_new_file(params, "r");
-    if (!bio)
-      fail("Unable to read certificate:\n%s",
-      ERR_error_string(ERR_get_error(), NULL));
-  
-    /* Try to read EC parameters from the certificate file first. */
-    ecg = PEM_read_bio_ECPKParameters(bio, NULL, NULL, NULL);
-    BIO_free(bio);
-    if (ecg) {
-        int nid = EC_GROUP_get_curve_name(ecg);
-        if (!nid) {
-          fail("Unable to find specified named curve");
-        }
-      
-        ecdh = EC_KEY_new_by_curve_name(nid);
-    }
-  }
-
-  /* Use prime256v1 by default. */
-  if (ecdh == NULL) {      
-    ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);      
-  }    
-
-  //ecdh = EC_KEY_new_by_curve_name(NID_X25519);        
-  //ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);      
-  
-  SSL_CTX_set_tmp_ecdh(ctx,ecdh);
-  EC_KEY_free(ecdh);  
+  set_params(ctx, params, 1);
 
   pthread_t threadid;
   if (pthread_create(&threadid, NULL, &server_thread, ctx))
@@ -382,7 +430,10 @@ main(int argc, char * const argv[]) {
     fprintf(stderr, "\n");
     fprintf(stderr, " - `certificate` is the name of the file containing the key and certificate.\n");    
     fprintf(stderr, "\n");
-    fprintf(stderr, " - `params` is the name of the file containing DH or ECDH params.\n");
+    fprintf(stderr, " - `params` selects the key exchange. It is either the name of a\n");
+    fprintf(stderr, "   file containing DH or ECDH params, or a group list such as\n");
+    fprintf(stderr, "   `x25519`, `ffdhe2048` or `X25519MLKEM768`. Run\n");
+    fprintf(stderr, "   `openssl list -tls-groups` to see what is supported.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, " - `handshakes` is the number of handshakes you wish to\n");
     fprintf(stderr, "   test. Defaults to 1000.\n");
@@ -413,22 +464,20 @@ main(int argc, char * const argv[]) {
     }
   }
 
-  start("Initialize OpenSSL library");
-  SSL_load_error_strings();
-  SSL_library_init();
-  if (!(mutex_buf = malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t))))
-    fail("Unable to allocate memory for mutex");
-  for (int i = 0;  i < CRYPTO_num_locks();  i++)
-    pthread_mutex_init(&mutex_buf[i], NULL);
-  CRYPTO_set_id_callback(id_function);
-  CRYPTO_set_locking_callback(locking_function);
+  /* OpenSSL 1.1.0 and later initialize themselves on first use and are
+     thread-safe without any locking callbacks from the application. */
+
+  /* Whichever of the two threads finishes first closes its end of the
+     socket pair, so the other one is bound to write to a closed peer.
+     We want the error from write(), not the default SIGPIPE death. */
+  signal(SIGPIPE, SIG_IGN);
 
   pthread_t client, server;
   start("Prepare client and server");
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, clientserver))
     fail("Unable to get a socket pair for client/server communication:\n%m");
   server = start_server(ciphersuite, certificate, params);
-  client = start_client(ciphersuite);
+  client = start_client(ciphersuite, params);
 
   struct result *client_result, *server_result;
   start("Waiting for client to finish");

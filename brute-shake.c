@@ -41,6 +41,7 @@
 #include "common.h"
 
 #include <unistd.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,6 +52,7 @@
 #include <pthread.h>
 #include <openssl/x509.h>
 #include <openssl/rsa.h>
+#include <openssl/evp.h>
 #include <openssl/err.h>
 
 /* Canned client messages */
@@ -248,11 +250,8 @@ can_client_keyexchange(X509 *cert) {
 
   /* Extract RSA public key */
   EVP_PKEY *pkey = X509_get_pubkey(cert);
-  if ((pkey == NULL) || (pkey->type != EVP_PKEY_RSA) ||
-      (pkey->pkey.rsa == NULL))
+  if ((pkey == NULL) || (EVP_PKEY_get_base_id(pkey) != EVP_PKEY_RSA))
     fail("Certificate does not seem to have a RSA public key");
-  RSA *rsa = pkey->pkey.rsa;
-  EVP_PKEY_free(pkey);
 
   /* Build buffer to encrypt */
   unsigned char buf[48];
@@ -261,15 +260,23 @@ can_client_keyexchange(X509 *cert) {
   /* We should fill random bytes, but no need, really */
 
   /* Encrypt */
-  int n;
+  int    n;
+  size_t outlen = sizeof(client_key_exchange) - 11;
   u_int16_t m;
-  if (sizeof(client_key_exchange) - 11 < RSA_size(rsa))
+  if (outlen < (size_t)EVP_PKEY_get_size(pkey))
     fail("Not enough space to store encrypted premaster secret");
-  n = RSA_public_encrypt(sizeof(buf),
-			 buf, client_key_exchange + 11,
-			 rsa, RSA_PKCS1_PADDING);
-  if (n <= 0)
-    fail("Unable to encrypt premaster secret");
+
+  EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_from_pkey(NULL, pkey, NULL);
+  if ((pctx == NULL) ||
+      (EVP_PKEY_encrypt_init(pctx) <= 0) ||
+      (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) <= 0) ||
+      (EVP_PKEY_encrypt(pctx, client_key_exchange + 11, &outlen,
+			buf, sizeof(buf)) <= 0))
+    fail("Unable to encrypt premaster secret:\n%s",
+	 ERR_error_string(ERR_get_error(), NULL));
+  EVP_PKEY_CTX_free(pctx);
+  EVP_PKEY_free(pkey);
+  n = outlen;
 
   /* Fix lengths */
   m = htons(n);
@@ -346,6 +353,10 @@ main(int argc, char * const argv[]) {
     fprintf(stderr, " - `port`: port to use (e.g 443)\n");
     return 1;
   }
+
+  /* Servers drop these deliberately incomplete handshakes, so writing to
+     a closed peer is the expected case rather than a fatal one. */
+  signal(SIGPIPE, SIG_IGN);
 
   const char      *ip     = argv[1];
   const char      *port   = argv[2];
